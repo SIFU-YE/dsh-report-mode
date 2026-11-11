@@ -1,0 +1,71 @@
+{
+  "name": "dsh-report-mode",
+  "version": "0.1.48",
+  "description": "Report mode for DSH: FineReport/.cpt delivery preset (MCP capabilities are mounted by the owning profile; persona does not embed MCP tool usage). Report artifacts and sandbox* historical data stay in the local repository only: the preset vendors a local-only git workflow (init/status/diff/log/commit/branch; no push, no remote creation). Delivered as a DSH 0.2.0 `@deepseek-ai/dsh-agent-preset` declaration row.",
+  "type": "module",
+  "main": "./lib/index.js",
+  "scripts": {
+    "sync:preset": "node scripts/sync-preset.mjs",
+    "check:runtime": "node scripts/check-runtime.mjs",
+    "check:preset": "node scripts/sync-preset.mjs --check",
+    "test": "node scripts/scan-secrets.mjs && node scripts/sync-preset.mjs --check && node --test test/host-guards.test.mjs test/persona-alignment.test.mjs test/local-git.test.mjs",
+    "gate": "node scripts/scan-secrets.mjs && node scripts/sync-preset.mjs --check && node --test test/host-guards.test.mjs test/persona-alignment.test.mjs test/local-git.test.mjs"
+  },
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./client/index.js",
+    "./host-tool-guard": "./lib/host-tool-guard.mjs",
+    "./restrict-host-git": "./lib/restrict-host-git.mjs",
+    "./restrict-host-toolbox": "./lib/restrict-host-toolbox.mjs",
+    "./restrict-host-team": "./lib/restrict-host-team.mjs",
+    "./guard-browser-local": "./lib/guard-browser-local.mjs",
+    "./delete-file": "./lib/delete-file.mjs",
+    "./local-git": "./lib/local-git/index.mjs",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "cordis.patch.yml",
+    "lib",
+    "client",
+    "presets",
+    "patches",
+    "tools",
+    "scripts",
+    "test",
+    "config",
+    "install",
+    "docs",
+    "README.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-session"
+      ],
+      "platform": "web"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2",
+    "@deepseek-ai/dsh-tools": "^0.2.0-rc.2"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "finereport",
+    "cpt",
+    "report"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/SIFU-YE/dsh-report-mode.git"
+  },
+  "private": true
+}
+

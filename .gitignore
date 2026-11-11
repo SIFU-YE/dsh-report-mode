@@ -1,0 +1,25 @@
+# 构建产物与本地状态
+node_modules/
+*.log
+.DS_Store
+.work/
+
+# 打包产物：发布时会重新生成，不入库（如需离线分发，改用 Gitee Release 附件）
+*.tgz
+
+# 真实凭据绝不入库
+.env
+.env.local
+gitee-credentials
+*.credentials
+
+# DSH 文件层会把绝对临时路径压平到工作区（例如 tmpdir 下的凭据文件会变成
+# <盘符><目录串>report-git-cred-<pid>-<ts>）。兜底忽略，防止任何
+# 临时文件被 git add -A 顺手提交——用通用模式，不带任何本机用户名。
+*report-git-cred*
+*report-mode-cred*
+
+# 编辑器
+.vscode/
+.idea/
+.remote-policy-test/

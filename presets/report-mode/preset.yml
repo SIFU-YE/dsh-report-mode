@@ -1,0 +1,2 @@
+name: 报表模式
+description: 报表专用模式（dsh-report-mode 提供）：FineReport/.cpt 报表工程；已挂载报表模板、官方文档检索、数据查询、本地预览、Excel 只读、git 落库等能力。具体能力与工具用法以运行时 tools/list 和各自服务说明为准；报表产物只做本地提交，不上云（含 sandbox* 历史数据）。无 shell、无公网；凭据与机器相关路径全部走 <DSH_HOME>/.env。

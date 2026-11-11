@@ -1,0 +1,472 @@
+# The `report-mode` agent preset: 报表模式 (report mode).
+#
+# 装配方式：DSH 0.2.0 起，真正挂载的是 cordis.patch.yml 里 `- id: preset-report-mode`
+# 的声明行（旧目录 `<DSH_HOME>/.agent-presets/report-mode` 已不再被读取）。本文件是该声明的
+# **语义源**，改完必须跑 `node scripts/sync-preset.mjs` 同步进 cordis.patch.yml
+# （`npm test` 里的 `sync-preset.mjs --check` 会拦住"只改镜像不改装配源"）。
+#
+# 构成：七个 MCP 服务器 —— `cpt-mcp`（FineReport .cpt 的增删改查/生成/校验；
+# 质量门禁）、`fr-docx-mcp`（帆软 FineBI/FineReport/FineDataLink 离线文档检索）、
+# `doris`、`mysql` 与 `testdb`（数据库查询）、`browser`（本地浏览器调试：headless Chrome 打开
+# FineReport 本地预览页，读 console / 截图 / 执行 JS）、`excel`（xlsx 只读：excel_inspect /
+# excel_profile_structure / excel_read_range_normalized / extract_images）—— 加上本地工具
+# read/write/edit、glob/grep、ask_user_question、todo、goal、plan mode、subagent、
+# delete_file 与 compaction，以及工具护栏（host 级 toolbox / 团队工具 deny、内置本地 git、
+# 浏览器 URL 本地白名单）。
+# 刻意不要 shell、不要公网、不要后台任务；goal / plan 只服务于本地报表规划与执行。
+#
+# 凭据与机器相关路径全部走环境变量（`!!js process.env.*`），值请放在
+# `<DSH_HOME>/.env`（该文件被 DSH 作为 user 层加载，且不进任何仓库）：
+#   REPORT_DORIS_HOST / REPORT_DORIS_PORT / REPORT_DORIS_USER / REPORT_DORIS_PASSWORD
+#                     / REPORT_DORIS_DATABASE（真实 .cpt 的 Doris SQL 有未限定表名，缺默认库会查不了）
+#   REPORT_MYSQL_HOST / REPORT_MYSQL_PORT / REPORT_MYSQL_USER / REPORT_MYSQL_PASSWORD
+#                     / REPORT_MYSQL_DATABASE
+#   REPORT_TESTDB_HOST / REPORT_TESTDB_PORT / REPORT_TESTDB_USER / REPORT_TESTDB_PASSWORD
+#                     （测试库-主节点，只读账号）
+#   REPORT_MYSQL_MCP_COMMAND（缺省 npx）/ REPORT_MYSQL_MCP_ENTRY（缺省 mysql-mcp-server）
+#   REPORT_CPT_DB_CONNECTIONS（可选）整串覆盖 cpt-mcp 的 CPT_DB_CONNECTIONS；不给时由上面三组
+#     REPORT_* 自动生成（见 mcp-cpt 行），连接名覆盖 Doris、填报-读写/MySQL、testdb/测试库。
+#     「外接数据库」是 FineDB 平台库（真实 .cpt 里查 fine_user/fine_department），**不在自动映射内**；
+#     FRDemo / middle读写 也未覆盖——需要时用 REPORT_CPT_DB_CONNECTIONS 整串覆盖。
+#   CPT_MCP_ALLOWED_ROOTS（缺省顺序：会话工作区 -> 用户主目录）
+#     报表目录不在用户主目录下时【必须】显式设置，否则 cpt-mcp 会拒绝所有 .cpt 路径
+# 模板见插件仓库的 config/report-mode.env.example。
+#
+# 为什么这些行都在 agent 平面：MCP 行只注册工具（@deepseek-ai/dsh-mcp-client 不提供
+# service），fs/search/ask/todo 行只消费 host 的 tools/fs 注册表也不提供任何东西，
+# 所以没有一行需要 isolate realm。MCP 服务器进程以会话工作区为 cwd 启动；cpt-mcp 自带
+# 路径白名单（CPT_MCP_ALLOWED_ROOTS），必须显式放行工作区，否则它会对工作区内的 .cpt
+# 报「路径不在允许目录内」——这是 cpt-mcp 自己的围栏，与 DSH 文件策略无关。
+
+# ── identity ────────────────────────────────────────────────────────────────
+
+# 预设自带的 persona，为本 agent 遮蔽部署默认人格。
+# `{{model}}` 由本 agent 自己的路由解析；**工作目录不要写成 `{{cwd}}`**——
+# agent-loop 只注册了 provider/model 两个变量，写成 `{{cwd}}` 会在装配时抛
+# 「unknown prompt variable」导致整轮失败；工作目录由 runtime context 自动注入
+# （@deepseek-ai/dsh-working-directory 注册 `working-directory:current` 段，
+# 内容为 `Current working directory: "<绝对路径>".`，且 interpolate:false）。
+- id: persona
+  name: '@deepseek-ai/dsh-persona'
+  config:
+    prefix: >-
+      【架构原则（2026-11-09）】本文件只定义「报表模式」的身份、模式级安全约束、
+      交付纪律与工作方式；不复制、不点名任何已挂载能力的工具名、参数或调用序列。
+      本模式挂载哪些能力、每个能力怎么用，一律以运行时 tools/list 与各自的服务说明
+      （instructions / schema）为准；能力之间互不依赖，本 persona 不假设某个能力存在，
+      也不把某个能力的内部语义写进另一个能力的提示。
+
+      你是报表模式（report mode）下的 FineReport 报表工程师，工作目录是你的会话工作区
+      （见下方 runtime context 的 Current working directory）。
+
+      模式级硬约束：
+      1. 无 shell、无公网、无团队协作、无跨会话记忆；不要尝试绕过。
+      2. 只允许访问本机回环地址上的报表预览页；禁止打开公网 URL。
+      3. 报表模板的读取、生成、修改、校验、交付只能通过已挂载的报表模板能力完成；
+         不要手工编辑 .cpt XML，也不要用文件工具替代模板能力。
+      4. 外部数据查询只读；不得写入生产库，不得把生产连接/凭据写进模板、预览平台或
+         工作区文件。测试环境必须使用该报表模板能力提供的本地测试机制。
+      5. 不把生产凭据、真实姓名、手机号、内网主机或对象存储桶名写入任何产物；
+         用环境变量或 [占位符] 代替。
+      6. 涉及官方功能/属性/写法时，先用已挂载的离线文档能力检索并引用原文；
+         文档未覆盖时明确说「未找到依据」，不要凭记忆编造。
+      7. 本地预览只用于查看真实渲染/交互；预览页里的任何数据连接都必须来自本地测试
+         环境，不能继承生产连接。未实际点检的运行期行为，交付结论必须写「运行期未验证」。
+      8. 交付前按已挂载报表模板能力提供的自检/门禁完成验证；子代理的“已完成/已验证”
+         不是验收证据，主 agent 必须亲自复核并在汇报里写清工具结论/时间/关键字段。
+      9. 版本控制只做本地提交：工作区尚未建仓时先用内置本地 git 工具初始化本地仓库（具体工具见 tools/list），改动前确认工作区状态，门禁通过后提交；不 push、不建远端、
+         不上传云端；不要使用任何会 push / 关联远端 / fetch / pull 的 git 工具；sandbox* 历史数据只留在本地仓库；无 git 时标注「未落库」。
+      10. 需求不明确时先问用户；不要先假定可以改报表、生成报表或连数据库。
+      11. 读取大 .cpt 时按报表模板能力提供的渐进式读取说明取最小子集，不要用文件工具
+          全文读取；具体读取工具以该能力说明为准。
+      12. 文件引用只写裸文件名并用反引号包裹（如 `xxx.cpt`），不带目录，便于侧边栏预览。
+
+      领域工作方式（不绑定具体工具）：
+      - 先理解报表目标、数据口径、参数/填报要求，再规划最小改动；
+      - 多步骤或创造性报表任务先建立目标与计划，计划确认前不改文件；
+      - 一次做一批改动，改完立即验证，不要零散试错；
+      - SQL/DDL 以用户/团队既有规范为准；涉及 DDL 先给方案并确认，不擅自改表结构；
+      - 报表数据查询与测试优先用本地测试环境；真实库仅用于只读核对；
+      - 样式、交互、填报等运行期结论必须来自真实预览或用户确认，不能只凭静态检查。
+
+
+- id: agent-instructions
+  name: '@deepseek-ai/dsh-agent-instructions'
+  config:
+    maxBytes: 65536
+
+# ── MCP servers（本模式的七个外部能力：cpt-mcp / fr-docx-mcp / doris / mysql /
+#    testdb / browser / excel）─────────────────────────────────────────────────
+
+# cpt-mcp: FineReport .cpt 报表文件增删改查、生成、校验；版本控制由本地 git 工具负责。
+# `serverName: cpt-mcp` 使它的工具以 `mcp__cpt-mcp__<tool>` 形式出现。
+# 注意：cpt-mcp 自带路径白名单（CPT_MCP_ALLOWED_ROOTS，分号分隔绝对路径），
+# 默认只允许「服务器进程目录 + 系统临时目录」。若不显式放行会话工作区，
+# 服务器会对工作区内的 .cpt 报「路径不在允许目录内」（首次测试实测如此）。
+# 放行顺序：显式 CPT_MCP_ALLOWED_ROOTS -> 会话工作区 DSH_CWD -> 用户主目录。
+# 注意 DSH_CWD 常常是空的（DSH 不把它导出到自身进程），所以显式值或主目录兜底是必需的：
+# 两端都空会让 cpt-mcp 拒绝所有 .cpt 路径。
+- id: mcp-cpt
+  name: '@deepseek-ai/dsh-mcp-client'
+  config:
+    serverName: cpt-mcp
+    transport: stdio
+    # 迁移友好：默认走 PATH 上的 cpt-mcp；若安装在非标准位置，
+    # 用 REPORT_CPT_MCP_COMMAND 指向可执行文件或 node+入口。
+    command: !!js process.env.REPORT_CPT_MCP_COMMAND ?? 'cpt-mcp'
+    cwd: !!js process.env.DSH_CWD ?? process.cwd()
+    env:
+      # 放行报表工作区与备份模板目录（test2 实测 backup 目录在围栏外被拒）。
+      # 显式值优先（可用用户级 setx 或 <DSH_HOME>/.env 设置）；未设置时退到 DSH_CWD 与用户主目录。
+      CPT_MCP_ALLOWED_ROOTS: !!js process.env.CPT_MCP_ALLOWED_ROOTS ?? process.env.DSH_CWD ?? process.env.USERPROFILE ?? ''
+      # 报表模式不做任何远端推送：即使 cpt-mcp 将来接入 git/push 能力，也显式关闭推送。
+      CPT_MCP_ALLOW_PUSH: '0'
+      # 报表模式专用档：report（cpt-mcp REPORT_STATIC_TOOLS，42 个静态工具 ~24k tokens；其余能力按
+      # 场景族租约解锁，长尾 adhoc 按名直租）。不用 focused（本模式需要的深层工具
+      # 按场景族租约解锁；静态表只保留高频入口，避免 persona 依赖具体工具名）。
+      # 也不用 full（188 工具 60k tokens 过重且深层租约失效）。
+      CPT_MCP_TOOL_PROFILE: !!js process.env.CPT_MCP_TOOL_PROFILE ?? 'report'
+      # 测试环境默认口径（2026-11-04）：SQL 数据集校验默认走内置 SQLite 测试库
+      # （cpt-mcp run_dataset_sql_check 的 target 缺省 local；真实库须显式 target:"real"/"both"）。
+      # 这里显式写出 'local'，让「换机器/换 cpt-mcp 版本」时报表模式的测试口径仍自证；可用用户级
+      # 环境变量 CPT_MCP_SQL_TARGET=real|local|both 覆盖（继承的 process.env 优先）。
+      CPT_MCP_SQL_TARGET: !!js process.env.CPT_MCP_SQL_TARGET ?? 'local'
+      # 真实库连接（cpt-mcp 侧）：与 doris/mysql/testdb 三个 MCP **同源**，由同一批 REPORT_* 环境变量
+      # 生成 CPT_DB_CONNECTIONS（cpt-mcp 的最高优先级连接源，见其 lib/db.js）。连接名覆盖 .cpt 里实际
+      # 用到的 'Doris'（→REPORT_DORIS_*）、'填报-读写' / 'MySQL'（→REPORT_MYSQL_*）、
+      # 'testdb' / '测试库'（→REPORT_TESTDB_*）。这样「只配 .env」时 run_dataset_sql_check(target:"real")
+      # 与 dataset_sql_parity 也能连真实库，不必再维护 ~/.cpt-mcp/db-connections.json 第二份配置。
+      # 注意：真实模板里的 '外接数据库' 是 FineDB 平台库（查 fine_user/fine_department），**不映射到
+      # Doris**；'FRDemo' / 'middle读写' 也未自动覆盖——需要时用 REPORT_CPT_DB_CONNECTIONS 整串覆盖。
+      # 整串 JSON 可用 REPORT_CPT_DB_CONNECTIONS 覆盖；本表达式不落任何明文口令。
+      CPT_DB_CONNECTIONS: !!js 'process.env.REPORT_CPT_DB_CONNECTIONS ?? JSON.stringify((() => {
+        const out = {};
+        const add = (names, prefix) => {
+          const host = process.env[prefix + "_HOST"];
+          if (!host) return;
+          const conn = { host };
+          const port = process.env[prefix + "_PORT"]; if (port) conn.port = port;
+          const user = process.env[prefix + "_USER"]; if (user) conn.user = user;
+          const password = process.env[prefix + "_PASSWORD"]; if (password) conn.password = password;
+          const database = process.env[prefix + "_DATABASE"]; if (database) conn.database = database;
+          for (const name of names) out[name] = { ...conn };
+        };
+        add(["Doris"], "REPORT_DORIS");
+        add(["填报-读写", "MySQL"], "REPORT_MYSQL");
+        add(["testdb", "测试库"], "REPORT_TESTDB");
+        return out;
+      })())'
+
+# fr-docx-mcp: 帆软离线文档检索。命令为全局安装的 `fr-docs-mcp` 可执行文件
+# （bin 名为 fr-docs-mcp，按用户命名约定 serverName 用 fr-docx-mcp）。
+- id: mcp-fr-docx
+  name: '@deepseek-ai/dsh-mcp-client'
+  config:
+    serverName: fr-docx-mcp
+    transport: stdio
+    # 迁移友好：默认走 PATH 上的 fr-docs-mcp；非标准安装位置用
+    # REPORT_FR_DOCS_MCP_COMMAND 覆盖。
+    command: !!js process.env.REPORT_FR_DOCS_MCP_COMMAND ?? 'fr-docs-mcp'
+    cwd: !!js process.env.DSH_CWD ?? process.cwd()
+# doris: Doris 数据库查询（mysql-mcp-server）。连接信息全部来自环境变量
+# REPORT_DORIS_*，取值见 <DSH_HOME>/.env（模板：config/report-mode.env.example）。
+- id: mcp-doris
+  name: '@deepseek-ai/dsh-mcp-client'
+  config:
+    serverName: doris
+    transport: stdio
+    command: !!js process.env.REPORT_MYSQL_MCP_COMMAND ?? 'npx'
+    args:
+      - '-y'
+      - !!js process.env.REPORT_MYSQL_MCP_ENTRY ?? 'mysql-mcp-server'
+    cwd: !!js process.env.DSH_CWD ?? process.cwd()
+    env:
+      MYSQL_HOST: !!js process.env.REPORT_DORIS_HOST ?? ''
+      MYSQL_PORT: !!js process.env.REPORT_DORIS_PORT ?? ''
+      MYSQL_USER: !!js process.env.REPORT_DORIS_USER ?? ''
+      MYSQL_PASSWORD: !!js process.env.REPORT_DORIS_PASSWORD ?? ''
+
+# mysql（填报）: MySQL 填报库查询（mysql-mcp-server）。连接信息全部来自环境变量
+# REPORT_MYSQL_*，取值见 <DSH_HOME>/.env（模板：config/report-mode.env.example）。
+- id: mcp-mysql
+  name: '@deepseek-ai/dsh-mcp-client'
+  config:
+    serverName: mysql
+    transport: stdio
+    command: !!js process.env.REPORT_MYSQL_MCP_COMMAND ?? 'npx'
+    args:
+      - '-y'
+      - !!js process.env.REPORT_MYSQL_MCP_ENTRY ?? 'mysql-mcp-server'
+    cwd: !!js process.env.DSH_CWD ?? process.cwd()
+    env:
+      MYSQL_DATABASE: !!js process.env.REPORT_MYSQL_DATABASE ?? ''
+      MYSQL_HOST: !!js process.env.REPORT_MYSQL_HOST ?? ''
+      MYSQL_PORT: !!js process.env.REPORT_MYSQL_PORT ?? ''
+      MYSQL_USER: !!js process.env.REPORT_MYSQL_USER ?? ''
+      MYSQL_PASSWORD: !!js process.env.REPORT_MYSQL_PASSWORD ?? ''
+
+# 测试库（测试环境数据库-主节点，只读账号）: mysql-mcp-server。
+# 连接信息全部来自 .env 的 REPORT_TESTDB_*（改连接只改 .env，改完重启）。
+# serverName=testdb → 工具名形如 mcp__testdb__*；该账号只读，只做 SELECT/SHOW/EXPLAIN。
+- id: mcp-testdb
+  name: '@deepseek-ai/dsh-mcp-client'
+  config:
+    serverName: testdb
+    transport: stdio
+    command: !!js process.env.REPORT_MYSQL_MCP_COMMAND ?? 'npx'
+    args:
+      - '-y'
+      - !!js process.env.REPORT_MYSQL_MCP_ENTRY ?? 'mysql-mcp-server'
+    cwd: !!js process.env.DSH_CWD ?? process.cwd()
+    env:
+      MYSQL_HOST: !!js process.env.REPORT_TESTDB_HOST ?? ''
+      MYSQL_PORT: !!js process.env.REPORT_TESTDB_PORT ?? ''
+      MYSQL_USER: !!js process.env.REPORT_TESTDB_USER ?? ''
+      MYSQL_PASSWORD: !!js process.env.REPORT_TESTDB_PASSWORD ?? ''
+
+# browser: 本地浏览器调试（chrome-devtools-mcp；工具名形如 mcp__browser__*）。
+# 用途：打开 FineReport 本地预览页（127.0.0.1 / localhost），读 console 报错、
+# 截图核对样式、evaluate_script 复现页面 JS 问题（v4 会话 77 步人肉排错的教训）。
+# --headless 无界面；--isolated 用一次性隔离 profile（自动清理，不碰用户真实
+# Chrome 数据）；--screenshotMaxWidth/Height 限制截图尺寸（控制上下文）。
+# 只允许本地预览 URL，禁止公网浏览：persona 约束 + 两层强制——工具层 guard-browser-local
+# （拦 navigate_page / new_page 的 URL）+ 浏览器网络层 --allowedUrlPattern（子资源 / 重定向 /
+# evaluate_script 内的 fetch / WebSocket 也拦，需 Chrome 149+；本机 Chrome 156 实测可用）。
+# URLPattern 语法不支持 [::1]（实测 Invalid URLPattern），故白名单不列 IPv6，guard 侧已同步收窄。
+# npx 零安装（复用全局 npm 缓存；fr-docs-mcp 行已实证裸命令名可启动）。0.1.31 起钉 chrome-devtools-mcp@1.12.0
+# （本机已缓存该版本）；换机/清缓存后首次启动可能联网拉包，需要预装或设 REPORT_BROWSER_MCP_ENTRY。
+- id: mcp-browser
+  name: '@deepseek-ai/dsh-mcp-client'
+  config:
+    serverName: browser
+    transport: stdio
+    command: npx
+    args:
+      - '-y'
+      - !!js process.env.REPORT_BROWSER_MCP_ENTRY ?? 'chrome-devtools-mcp@1.12.0'
+      - '--headless'
+      - '--isolated'
+      # 只保留报表调试真正要用的分类（console 读取 / 截图 / evaluate / navigate）：
+      # 关掉 network/performance/emulation/input/memory 五类 → 工具数 30 → 15（chrome-devtools-mcp 1.12.0 实测）
+      - '--no-categoryNetwork'
+      - '--no-categoryPerformance'
+      - '--no-categoryEmulation'
+      - '--no-categoryInput'
+      - '--no-categoryMemory'
+      - '--screenshotMaxWidth'
+      - '1280'
+      - '--screenshotMaxHeight'
+      - '800'
+      # 浏览器网络层白名单（chrome-devtools-mcp --allowedUrlPattern，需 Chrome 149+；本机 Chrome 156）：
+      # 只放行本地预览来源，从网络层拦掉子资源 / 重定向 / evaluate_script 内的 fetch、WebSocket、
+      # location.href——补上 guard-browser-local（只拦 navigate_page / new_page）的缺口。
+      # 端口用 * 匹配 FineReport 随机预览端口。URLPattern 不支持 [::1]（实测 Invalid URLPattern），
+      # 故不列 IPv6。Chrome <149 时该参数可能让 MCP 启动失败：升级 Chrome，或临时用
+      # REPORT_BROWSER_MCP_ENTRY 指回旧入口并删掉本段（见 README / INSTALL）。
+      - '--allowedUrlPattern'
+      - 'http://localhost:*/*'
+      - 'https://localhost:*/*'
+      - 'http://127.0.0.1:*/*'
+      - 'https://127.0.0.1:*/*'
+      - 'http://*.localhost:*/*'
+      - 'https://*.localhost:*/*'
+    cwd: !!js process.env.DSH_CWD ?? process.cwd()
+
+# 浏览器 URL 护栏（guard-browser-local）：persona 说"只允许本地预览页、禁止公网"，但浏览器 MCP
+# 本身接受任意 URL（navigate_page / new_page）——本模式没有 shell、没有公网，浏览器是唯一对外
+# 通道，必须用工具层 guard 强制：navigate_page（type=url 或带 url）与 new_page 的 url 只放行
+# localhost / 127.0.0.1 / *.localhost 与 about:blank，其余调用直接返回中文拒绝原因。
+# 与 mcp-browser 的 --allowedUrlPattern（浏览器网络层，拦子资源 / evaluate 内 fetch）配套：
+# 白名单刻意一致（都不含 IPv6——URLPattern 不支持 [::1]），避免"guard 放行但网络层拒绝"。
+# 只做 guard（调用时拒绝），不做 restrict：本地预览需要这两个工具留在 schema 里。
+# 实现见 lib/guard-browser-local.mjs；scoped 行，只作用于报表模式；guard 不可用时 fail-open 只告警。
+- id: guard-browser-local
+  name: dsh-report-mode/guard-browser-local
+
+# mcp-excel: 轻量 xlsx/xlsm/xls/xlsb/ods **只读**（excel-tools-mcp 0.1.3，
+# pypi 32KB + openpyxl/calamine；工具名形如 mcp__excel__*，共四个：
+# excel_inspect / excel_profile_structure / excel_read_range_normalized / extract_images）。
+# 用途：报表模式读导入模板/填报底表（cpt-mcp 只管 .cpt，不管通用 xlsx 读取）。
+# 没有 dsh-office-tools：本模式不能创建/编辑 Office 文件（persona 已写明）。
+# command 走 PATH 上的 python（或由 REPORT_EXCEL_MCP_PYTHON 指定完整路径）：写死本机 python.exe 的绝对路径会让"换机器"直接失效。
+- id: mcp-excel
+  name: '@deepseek-ai/dsh-mcp-client'
+  config:
+    serverName: excel
+    transport: stdio
+    command: !!js process.env.REPORT_EXCEL_MCP_PYTHON ?? 'python'
+    args:
+      - '-m'
+      - 'excel_tools.server'
+    cwd: !!js process.env.DSH_CWD ?? process.cwd()
+
+# host 级 mcp-toolbox 裁剪（restrict-host-toolbox）：profile 根级 insert 的 mcp-toolbox
+# （serverName: toolbox，3 个 query 工具）与上面 doris/mysql/testdb 三个 MCP 同库重复，报表模式
+# 只需后者（persona 也只描述后者，并规定"不调用清单外工具"）。host 级工具对所有预设可见，
+# 这里两层屏蔽：官方 tools.restrict({ deny }) 隐藏 schema（best-effort——MCP 工具异步注册，
+# 预设挂载时名字可能还没注册，此时 restrict 会抛"unknown name"，0.1.30 实测会 fail-open）+
+# tools.guard 在调用时拒绝（强制层，与注册时序无关）。实现见 lib/restrict-host-toolbox.mjs。
+- id: restrict-host-toolbox
+  name: dsh-report-mode/restrict-host-toolbox
+
+# ── small local toolkit ──────────────────────────────────────────────────────
+
+# File read/write/edit (read / write / edit) against the host
+# `fs` service and its sandbox policy — no realm, like `standard`.
+- id: tool-fs
+  name: '@deepseek-ai/dsh-tool-fs'
+
+# glob / grep discovery.
+- id: tool-fs-search
+  name: '@deepseek-ai/dsh-tool-fs-search'
+  config:
+    sampleOverCapGlobResults: false
+
+# 删除文件（delete_file）：**预设内 scoped 行，只有报表模式能看到**。
+# 实现见 lib/delete-file.mjs（子路径 dsh-report-mode/delete-file）；不装 host 级插件，
+# 因为 host 级注册对所有预设可见。安全语义：仅工作区内、拒绝受保护路径段、
+# 默认移入同级 .trash（use_trash=false 才硬删）。
+- id: delete-file
+  name: dsh-report-mode/delete-file
+
+# Ask the user for requirements and clarifications.
+- id: tool-ask-user
+  name: '@deepseek-ai/dsh-tool-ask-user'
+
+# Multi-step report todo tracking.
+- id: tool-todo
+  name: '@deepseek-ai/dsh-tool-todo'
+  config:
+    allowParallelInProgress: true
+
+# ── goal / plan mode：多步骤报表任务的长期目标与计划审批 ─────────────────────
+# goal 工具用于跨轮持续的目标（报表改造、批量校验、长时间重构）；plan mode 用于先出
+# 完整实施方案、经用户确认后再改文件。两者都只消费 host 工具，不引入 shell/公网。
+- id: command-goal
+  name: '@deepseek-ai/dsh-command-goal'
+
+- id: tool-goal
+  name: '@deepseek-ai/dsh-tool-goal'
+
+- id: planning
+  name: cordis:group
+  group: true
+  isolate:
+    planMode: true
+  config:
+    - id: plan-mode
+      name: '@deepseek-ai/dsh-plan-mode'
+      config:
+        section: >
+          You are in plan mode. Stay in plan mode until exit_plan_mode
+          succeeds or the user switches the session mode. Imperative
+          language to implement changes means plan the implementation, not
+          execute it. A user's conversational agreement — including an
+          answer confirming something you asked — approves nothing and
+          does not end plan mode; fold the confirmed decision into the
+          plan and submit it through exit_plan_mode.
+
+
+          Explore first. Use non-mutating reads, searches, static
+          analysis, and checks to ground the plan in the actual
+          repository. Do not edit or write files, change configuration,
+          run formatters or code generation that rewrites tracked files,
+          commit, or otherwise carry out the plan. Prefer existing
+          functions and patterns over new machinery.
+
+
+          The tool catalog stays the same across modes for request-cache
+          stability. These plan-mode rules override any later tool
+          description or guidance that suggests using mutation tools;
+          those tools remain listed to keep the tool catalog unchanged. Do
+          not use todo_write to track this planning phase: it tracks
+          implementation after an approved plan, while the plan itself
+          belongs in exit_plan_mode.
+
+
+          Resolve discoverable facts by inspection. Use ask_user_question
+          only for user-owned choices or material ambiguity that
+          inspection cannot answer. Do not ask the user where code lives
+          or how current behavior works when you can find out.
+
+
+          Make the plan decision-complete: state the goal and success
+          criteria; group implementation changes by subsystem; identify
+          public API, schema, and data-flow changes; cover edge cases,
+          failure modes, tests, acceptance criteria, and explicit
+          assumptions. Keep it concise enough to review but detailed
+          enough that another engineer can implement it without making
+          design decisions.
+
+
+          When ready, call exit_plan_mode with the complete plan markdown,
+          starting with a # title. Make exit_plan_mode the only and final
+          tool call in that assistant response: it presents the plan for
+          approval, and implementation begins only in a later step after
+          approval. Do not paste the final plan as a plain reply or ask
+          "should I proceed?" through prose or ask_user_question. If
+          review rejects it, incorporate the feedback and present again.
+          If the review channel is unavailable or aborted, stay in plan
+          mode and ask the user to switch modes manually; do not proceed
+          with implementation.
+
+
+# ── subagent 委派 ──────────────────────────────────────────────────────────
+#
+# 允许模型把独立的子任务（复杂查询、批量分析、结果审查等）委派给子代理执行。
+# subagent 服务与 `spawn` 后端已由 DSH 基础层/标准模式全局注册，这里只暴露工具。
+- id: tool-subagent
+  name: '@deepseek-ai/dsh-tool-subagent'
+  config:
+    provider: spawn
+    toolName: subagent
+    backgroundMode: continuable
+
+# ── 子代理复用/打断通道（0.1.17 补回）───────────────────────────────────────
+#
+# 子代理委派后需要复用/打断通道；这里只暴露工具，不向 persona 写入具体工具名。
+# 0390fb1 回退 0.1.15 时曾把控制工具连带撤掉，469 个报表会话实测 subagent 新建 118 次、
+# 复用/打断 0 次；用户改了已提交的信息也没有任何手段叫停在跑的子代理。
+# registry 与 spawn 后端在 host 侧，这里只暴露工具（纯消费型行，无需 isolate）。
+- id: tool-subagent-control
+  name: '@deepseek-ai/dsh-tool-subagent-control'
+
+# host 团队工具裁剪（restrict-host-team）：profile 里 experimental-agent-team-profile 注册的
+# spawn_teammate / wait_agent / team_task_* 对所有预设可见，但报表模式 persona 明确"不启用团队
+# 协作"——形成"可见但被规则禁止"。本行两层屏蔽：restrict 隐藏 schema（best-effort，team 工具
+# 异步注册时可能失败）+ guard 在调用时拒绝（强制）；保留 list_agents / send_message /
+# interrupt_agent（子代理复用协议依赖它们）。实现见 lib/restrict-host-team.mjs。
+- id: restrict-host-team
+  name: dsh-report-mode/restrict-host-team
+
+# ── git：内置本地工具，只做本地提交，不接远端（2026-11-09）────────────────
+#
+# 报表工作产物（.cpt / SQL / 样例 / sandbox* 历史数据）只保留在本地仓库：
+# · 本预设内置 lib/local-git（vendored 自 dsh-plugin-git-workflow）：
+#   git_init / git_status / git_diff / git_log / git_commit / git_branch；
+#   它没有 push / 建远端能力；不注册任何远端工具。
+# · 因此不再需要 profile 的 host 级 dsh-plugin-git-workflow bundle（两者会重复注册）。
+# · 云端上传不是报表模式的职责；本地提交就是版本控制。
+
+- id: report-local-git
+  name: dsh-report-mode/local-git
+
+- id: compaction
+  name: cordis:group
+  group: true
+  isolate:
+    compaction: true
+    toolResultPruner: true
+  config:
+    - id: compaction-basic
+      name: '@deepseek-ai/dsh-compaction-basic'
+
+    - id: command-compact
+      name: '@deepseek-ai/dsh-command-compact'
+
+    - id: tool-result-pruner
+      name: '@deepseek-ai/dsh-compaction-tool-result-pruner'
+      config:
+        thresholdChars: 8192
+        headChars: 4096
+        tailChars: 1024

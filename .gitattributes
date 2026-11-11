@@ -1,0 +1,15 @@
+# 仓库统一用 LF。
+#
+# 为什么这条是必须的：本机（以及大多数 Windows 开发机）全局 core.autocrlf=true，
+# git 检出时会把文本文件变成 CRLF。而 patches/*.patch 是 unified diff，补丁应用器
+# 按行匹配上下文——一旦补丁变成 CRLF，hunk 内容就会带上尾随 \r 而失配。
+# 应用器本身也做了 CR 剥离兜底，但那不该是唯一防线。
+* text=auto eol=lf
+
+# 二进制/产物：不做行尾转换
+*.tgz binary
+*.png binary
+*.ico binary
+
+# 补丁文件必须逐字节稳定（哈希参与校验）
+*.patch -text

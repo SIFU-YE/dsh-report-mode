@@ -1,0 +1,54 @@
+{
+  "base": "@nanmicoder/dsh-agent-teams",
+  "version": "0.1.20",
+  "patch": "dsh-agent-teams-0.1.20-report.patch",
+  "comment": "版本锁：安装脚本会先校验目标包版本与这些归一化（LF）sha256，任一不符即拒绝打补丁，避免上游改动被静默盖掉。",
+  "preImage": {
+    "lib/index.js": "1742ca136c3b5594e78609e6e23ebc49f54841353b847603fc99937e081bc4dc",
+    "lib/tool-names.js": "faa05571fd224d91936b90c849cbf02404dbd928462acac51d43d31242dcb310",
+    "lib/tools.js": "2855e94e16859292e67bc41587963c0977d5cb4fd807ef4d0e7e18aed2eb058c"
+  },
+  "postImage": {
+    "lib/index.js": "4ac29529810db301c730d04d7d574604e9740a5fe8cbec15b7c35d578e08cb83",
+    "lib/tool-names.js": "aafd8b337d89b016ec5e20131e16c16f06cc45d846833748ea62e05d7354dfe3",
+    "lib/tools.js": "d139d06b07869b186b1b1de38084ece5117fcd5501193f6d849cf4d6a3aadd85",
+    "lib/memory.js": "945e5b4c6314b49bb1835ce02901437ac4e14df68e51eb90962b59488fed6b21"
+  },
+  "marker": "dsh-report-mode",
+  "hunks": [
+    {
+      "file": "lib/index.js",
+      "purpose": "命令-only：注释掉 installAgentTeamsGestureBoundary 调用，只保留 /agent-teams 斜杠命令。",
+      "forkOrigin": "src/index.ts（原 fork：注释该调用并去掉 import）"
+    },
+    {
+      "file": "lib/tool-names.js",
+      "purpose": "把三个 memory 工具纳入工具名清单：既进队长 usage 提示，也进能力门禁（grant 保持队长专属，write/read 对成员开放）。",
+      "forkOrigin": "0.1.20 起工具名集中在本文件；原 fork 是把名字写进 index.ts 的字面量数组，在新版本上必须改这里"
+    },
+    {
+      "file": "lib/tools.js",
+      "purpose": "① agent_teams_send_message 在队员互发消息时同步投递一条只读通知给队长邮箱（durable），出锁后尝试实时 steer，失败退回邮箱；② 注册 agent_teams_memory_write/read/grant_memory 三个工具。",
+      "forkOrigin": "src/tools.ts（原 fork 的同名两处改动）"
+    },
+    {
+      "file": "lib/memory.js",
+      "purpose": "新增文件：按成员分域的记忆池（<stateDir>/<teamId>/memory/<member>.jsonl + grants.json）。",
+      "forkOrigin": "src/memory.ts（原 fork 新增文件）"
+    }
+  ],
+  "outOfPatch": [
+    {
+      "item": "背景色/角标标识",
+      "reason": "只用 /plugins/dsh-agent-teams/state 路由 + ctx.sessions + ctx.effect 等公开接口，已外移到本包 client 半区（client/index.js），零补丁。"
+    },
+    {
+      "item": "成员/队长规则文本",
+      "reason": "上游本就支持 executionPrompt（全局/按 profile/按成员三级），已外移到 cordis.patch.yml 配置，零补丁。"
+    },
+    {
+      "item": "报表团队 profile 模板",
+      "reason": "纯配置，已外移到本包 bundle patch 的 agent-teams 行。"
+    }
+  ]
+}

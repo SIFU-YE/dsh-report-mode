@@ -1,0 +1,2 @@
+name: 编码（Git Bash）
+description: 功能完整的编码 Agent（由内置 standard 复制而来）：文件编辑、Shell、检索、Skills、计划、目标、子代理与工作流。shell 显式使用 Git Bash（tool-bash 启用、tool-pwsh 关闭）；报表模式（report-mode）保持无 shell。
