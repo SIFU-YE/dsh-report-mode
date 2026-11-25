@@ -1,0 +1,259 @@
+diff --git a/lib/index.js b/lib/index.js
+index fef8742..8038467 100644
+--- a/lib/index.js
++++ b/lib/index.js
+@@ -139,7 +139,9 @@ export function apply(ctx, config) {
+         ctx.inject(['commands'], (commandCtx) => {
+             registerAgentTeamsCommand(commandCtx, () => config.profiles ?? {});
+         });
+-        installAgentTeamsGestureBoundary(ctx, () => config.profiles ?? {});
++        // dsh-report-mode: 报表模式要求「命令-only」——只保留 /agent-teams 斜杠命令，
++        // 关闭自然语言手势触发，避免报表模式下被普通叙述误触发团队创建。
++        // installAgentTeamsGestureBoundary(ctx, () => config.profiles ?? {});
+     }
+     // The activity panel data/artwork routes need the Web server and the
+     // workspace registry, which headless profiles do not mount; under
+diff --git a/lib/memory.js b/lib/memory.js
+new file mode 100644
+index 0000000..909558b
+--- /dev/null
++++ b/lib/memory.js
+@@ -0,0 +1,91 @@
++/**
++ * AgentTeams scoped memory: per-member private memory + teamleader grants.
++ *
++ * Added by the dsh-report-mode patch (报表模式需求 2): teammate memory sharing
++ * is restricted. Each member has a private memory namespace under
++ *   <stateDir>/<teamId>/memory/<memberName>.jsonl
++ * The captain has `captain.jsonl`. A member can only read their own memory
++ * unless the captain grants them read access to another member's namespace.
++ * Grants persist in <stateDir>/<teamId>/memory/grants.json.
++ *
++ * This is a lightweight, file-backed memory pool. It is deliberately additive:
++ * nothing in the patched upstream modules other than the three tool
++ * registrations in tools.js depends on it.
++ * @module dsh-agent-teams/memory
++ */
++import { mkdir, readFile, writeFile } from 'node:fs/promises';
++import { join } from 'node:path';
++import { randomUUID } from 'node:crypto';
++export const MEMORY_DIR = 'memory';
++export const GRANTS_FILE = 'grants.json';
++export const MEMORY_CAPTAIN_KEY = 'captain';
++async function ensureMemoryDir(stateRoot, teamId) {
++    await mkdir(join(stateRoot, teamId, MEMORY_DIR), { recursive: true });
++}
++/** One namespace file per member; the name is sanitized so it stays a file name. */
++function memoryFilePath(stateRoot, teamId, memberName) {
++    return join(stateRoot, teamId, MEMORY_DIR, `${memberName.replace(/[^\w.-]+/g, '_')}.jsonl`);
++}
++function grantsFilePath(stateRoot, teamId) {
++    return join(stateRoot, teamId, MEMORY_DIR, GRANTS_FILE);
++}
++/** Append one entry to a member's own namespace and return it. */
++export async function appendMemory(stateRoot, teamId, memberName, content) {
++    await ensureMemoryDir(stateRoot, teamId);
++    const entry = { id: randomUUID(), member: memberName, content, ts: Date.now() };
++    const file = memoryFilePath(stateRoot, teamId, memberName);
++    let existing = '';
++    try {
++        existing = await readFile(file, 'utf8');
++    }
++    catch {
++        // First write for this namespace.
++    }
++    const separator = existing.length > 0 && !existing.endsWith('\n') ? '\n' : '';
++    await writeFile(file, `${existing}${separator}${JSON.stringify(entry)}\n`, 'utf8');
++    return entry;
++}
++/** Read one namespace, oldest first; an absent namespace reads as empty. */
++export async function readMemory(stateRoot, teamId, memberName) {
++    const file = memoryFilePath(stateRoot, teamId, memberName);
++    try {
++        const text = await readFile(file, 'utf8');
++        return text.split('\n').filter(Boolean).map((line) => JSON.parse(line));
++    }
++    catch {
++        return [];
++    }
++}
++/** Every grant recorded for this team; an absent file reads as none. */
++export async function readGrants(stateRoot, teamId) {
++    const file = grantsFilePath(stateRoot, teamId);
++    try {
++        const text = await readFile(file, 'utf8');
++        return JSON.parse(text);
++    }
++    catch {
++        return [];
++    }
++}
++async function writeGrants(stateRoot, teamId, grants) {
++    await ensureMemoryDir(stateRoot, teamId);
++    await writeFile(grantsFilePath(stateRoot, teamId), JSON.stringify(grants, null, 2), 'utf8');
++}
++/** Grant `grantee` read access to `scope`; granting twice is a no-op. */
++export async function grantMemory(stateRoot, teamId, grantedBy, grantee, scope) {
++    const grants = await readGrants(stateRoot, teamId);
++    const existing = grants.find((grant) => grant.grantee === grantee && grant.scope === scope);
++    if (existing !== undefined)
++        return existing;
++    const grant = { grantee, scope, grantedBy, ts: Date.now() };
++    grants.push(grant);
++    await writeGrants(stateRoot, teamId, grants);
++    return grant;
++}
++/** Whether `callerName` may read `scope`: own namespace, captain, or a grant. */
++export async function canReadMemory(stateRoot, teamId, callerName, scope) {
++    if (callerName === scope || callerName === MEMORY_CAPTAIN_KEY)
++        return true;
++    const grants = await readGrants(stateRoot, teamId);
++    return grants.some((grant) => grant.grantee === callerName && grant.scope === scope);
++}
+diff --git a/lib/tool-names.js b/lib/tool-names.js
+index 2f2f16a..9c1739e 100644
+--- a/lib/tool-names.js
++++ b/lib/tool-names.js
+@@ -5,8 +5,14 @@ export const TEAM_TOOL_NAMES = [
+     'agent_teams_reassign_task', 'agent_teams_claim_task', 'agent_teams_update_task',
+     'agent_teams_amend_task',
+     'agent_teams_send_message', 'agent_teams_status', 'agent_teams_resume', 'agent_teams_delete',
++    // dsh-report-mode: scoped memory surface. Listing them here puts them in the
++    // captain usage prompt AND under the capability gate below, where the grant
++    // tool stays captain-only while write/read still reach members.
++    'agent_teams_memory_write', 'agent_teams_memory_read', 'agent_teams_grant_memory',
+ ];
+ export const MEMBER_TOOL_NAMES = [
+     'agent_teams_claim_task', 'agent_teams_update_task', 'agent_teams_send_message', 'agent_teams_status',
++    // dsh-report-mode: a member writes and reads its own namespace only.
++    'agent_teams_memory_write', 'agent_teams_memory_read',
+ ];
+ export const CAPTAIN_TOOL_NAMES = TEAM_TOOL_NAMES.filter(name => !MEMBER_TOOL_NAMES.includes(name));
+diff --git a/lib/tools.js b/lib/tools.js
+index 1372789..e1cfe83 100644
+--- a/lib/tools.js
++++ b/lib/tools.js
+@@ -18,6 +18,8 @@ import { TERMINAL_TASK_STATUSES } from "./types.js";
+ import { collectCompletedDependencyOutputs, formatDependencyOutputs, installTeamScheduler } from "./scheduler.js";
+ import { installMailboxAdmission, mailboxPrompt } from "./mailbox.js";
+ import { resolveTeamProfile } from "./profiles.js";
++// dsh-report-mode: scoped memory (报表模式需求 2).
++import { appendMemory, canReadMemory, grantMemory, readMemory } from "./memory.js";
+ export { steerCaptainReport } from "./members.js";
+ /** The caller agent, or a loud failure for non-agent callers. */
+ function requireCaptain(exec) {
+@@ -1813,7 +1815,19 @@ export function registerAgentTeamsTools(ctx, config) {
+                     content: args.content,
+                     ts: message.ts,
+                 });
+-                return { kind: 'member', fresh, identity, message, from, recipient };
++                // dsh-report-mode: 报表模式需求 —— teammate 之间的交流必须通知 teamleader。
++                // 通知先落后队长邮箱（durable），出锁后再尝试实时投递；只读通知，不进入审批流。
++                const notification = { ...createMessage(from, CAPTAIN_KEY, `[teammate-message] ${from} -> ${recipient.name}: ${args.content}`), deliveryClaimedAt: Date.now() };
++                await appendMailbox(stateRoot, fresh.id, CAPTAIN_KEY, notification);
++                appendTeamEvent(ctx, captainSessionOf(ctx, fresh.captainSessionId, caller.session), 'agent-teams/message-notify', {
++                    teamId: fresh.id,
++                    messageId: notification.id,
++                    from,
++                    to: recipient.name,
++                    content: args.content,
++                    ts: notification.ts,
++                });
++                return { kind: 'member', fresh, identity, message, from, recipient, notification };
+             });
+             // Resolve the exact live captain only after releasing the state lock.
+             // The plugin mailbox is already durable if live delivery cannot proceed.
+@@ -1843,6 +1857,16 @@ export function registerAgentTeamsTools(ctx, config) {
+             if (delivered === 'mailbox') {
+                 await withTeamLock(teamLockKey(stateRoot, prepared.fresh.id), () => (releaseMailboxDelivery(stateRoot, prepared.fresh.id, prepared.recipient.name, [prepared.message.id])));
+             }
++            // dsh-report-mode: 把 teammate 交流的只读通知送达队长——在线则实时 steer，
++            // 否则留在队长邮箱等下一次读取。投递失败一律退回 durable 邮箱，绝不丢通知。
++            if (prepared.notification !== undefined) {
++                const notified = captain === undefined
++                    ? false
++                    : steerCaptainReport(captain, `${prepared.from}->${prepared.recipient.name}`, `[teammate-message] ${prepared.from} 发给 ${prepared.recipient.name}：${args.content}`, mailboxPrompt(prepared.fresh.id, CAPTAIN_KEY, [prepared.notification]));
++                await withTeamLock(teamLockKey(stateRoot, prepared.fresh.id), () => (notified
++                    ? markMailboxDelivered(stateRoot, prepared.fresh.id, CAPTAIN_KEY, [prepared.notification.id])
++                    : releaseMailboxDelivery(stateRoot, prepared.fresh.id, CAPTAIN_KEY, [prepared.notification.id])));
++            }
+             return {
+                 message_id: prepared.message.id,
+                 from: prepared.from,
+@@ -1851,6 +1875,76 @@ export function registerAgentTeamsTools(ctx, config) {
+             };
+         },
+     }));
++    // dsh-report-mode: 报表模式需求 2 —— scoped memory。
++    // 每个成员一块私有记忆（<stateDir>/<teamId>/memory/<member>.jsonl），
++    // 只有本人与队长可读；读他人记忆须队长先授权（grants.json）。
++    ctx.tools.register(defineTool({
++        name: 'agent_teams_memory_write',
++        description: 'Append a memory entry to YOUR OWN private memory namespace (member or captain). Persist facts/conclusions for later reuse within this team. Each member can only write its own memory.',
++        parameters: { content: { type: 'string', required: true, description: 'The fact/conclusion to remember.' } },
++        output: {
++            schema: { type: 'object', additionalProperties: false, properties: { member: { type: 'string', required: true }, entry_id: { type: 'string', required: true } } },
++            render: (_args, value) => [{ type: 'text', text: `Memory saved for ${value.member} (${value.entry_id}).` }],
++        },
++        async execute(args, exec) {
++            const caller = requireCaptain(exec);
++            const workspace = workspaceOf(caller);
++            const stateRoot = stateRootOf(workspace, config);
++            const team = await requireParticipantTeam(workspace, config, caller);
++            const { team: fresh, identity } = await withTeamLock(teamLockKey(stateRoot, team.id), () => requireFreshParticipant(stateRoot, team.id, caller.id));
++            const entry = await appendMemory(stateRoot, fresh.id, identity.name, String(args.content ?? ''));
++            return { member: identity.name, entry_id: entry.id };
++        },
++    }));
++    ctx.tools.register(defineTool({
++        name: 'agent_teams_memory_read',
++        description: 'Read memory entries of a member. You can always read your own; reading another member requires the captain to have granted you access via agent_teams_grant_memory. Irrelevant members cannot see others memory.',
++        parameters: { member: { type: 'string', required: true, description: 'Memory namespace to read (your own name, or another member granted to you).' } },
++        output: {
++            schema: { type: 'object', additionalProperties: true, properties: {} },
++            render: (_args, value) => [{ type: 'text', text: String(value.text ?? '') }],
++        },
++        async execute(args, exec) {
++            const caller = requireCaptain(exec);
++            const workspace = workspaceOf(caller);
++            const stateRoot = stateRootOf(workspace, config);
++            const team = await requireParticipantTeam(workspace, config, caller);
++            const { team: fresh, identity } = await withTeamLock(teamLockKey(stateRoot, team.id), () => requireFreshParticipant(stateRoot, team.id, caller.id));
++            const scope = args.member.trim();
++            const allowed = await canReadMemory(stateRoot, fresh.id, identity.name, scope);
++            if (!allowed)
++                throw new Error(`you are not authorized to read memory of "${scope}"; ask the teamleader (captain) to grant access via agent_teams_grant_memory`);
++            const entries = await readMemory(stateRoot, fresh.id, scope);
++            const text = entries.length === 0 ? `(no memory for ${scope})` : entries.map((entry) => `[${entry.ts}] ${entry.content}`).join('\n');
++            return { member: scope, entries: entries.length, text };
++        },
++    }));
++    ctx.tools.register(defineTool({
++        name: 'agent_teams_grant_memory',
++        description: 'Captain-only: authorize a member to read another member memory namespace. A member remains unable to read others memory until granted.',
++        parameters: {
++            member: { type: 'string', required: true, description: 'The member being granted access.' },
++            scope: { type: 'string', required: true, description: 'Which member memory namespace to grant read access to.' },
++        },
++        output: {
++            schema: { type: 'object', additionalProperties: false, properties: { grantee: { type: 'string', required: true }, scope: { type: 'string', required: true } } },
++            render: (_args, value) => [{ type: 'text', text: `Granted ${value.grantee} read access to ${value.scope} memory.` }],
++        },
++        async execute(args, exec) {
++            const caller = requireCaptain(exec);
++            const workspace = workspaceOf(caller);
++            const stateRoot = stateRootOf(workspace, config);
++            const team = await requireParticipantTeam(workspace, config, caller);
++            const { team: fresh, identity } = await withTeamLock(teamLockKey(stateRoot, team.id), () => requireFreshParticipant(stateRoot, team.id, caller.id));
++            if (identity.kind !== 'captain')
++                throw new Error('agent_teams_grant_memory is captain-only');
++            const grantee = args.member.trim();
++            const scope = args.scope.trim();
++            requireMember(fresh, grantee);
++            await grantMemory(stateRoot, fresh.id, identity.name, grantee, scope);
++            return { grantee, scope };
++        },
++    }));
+     ctx.tools.register(defineTool({
+         name: 'agent_teams_status',
+         description: 'Team snapshot: members with live activity and tasks with status/assignee/dependencies/output. Captains also see every team mailbox; members see only their own inbox. Use after mailbox progress deliveries or for an explicit status request. After dispatch, end your turn while members work; do not repeatedly poll.',

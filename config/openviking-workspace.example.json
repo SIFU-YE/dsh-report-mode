@@ -1,0 +1,6 @@
+{
+  "version": 1,
+  "capture": {
+    "commit_token_threshold": 15000
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "name": "dsh-coding-preset",
+  "version": "1.0.0",
+  "description": "DSH 0.2.0 预设声明 bundle：编码（Git Bash）（由旧目录式用户预设 .agent-presets/coding 迁移而来）",
+  "private": true,
+  "type": "module",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}
